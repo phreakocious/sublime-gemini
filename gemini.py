@@ -6,11 +6,10 @@ import json
 import uuid
 import tempfile
 import time
-import shlex
 
 try:
     from . import gemini_server
-except:
+except Exception:
     import gemini_server
 
 # --- Global State ---
@@ -89,7 +88,7 @@ def format_context_string(view, target, roots):
     rc_end = view.rowcol(target.end())
     l_start, l_end = rc_start[0] + 1, rc_end[0] + 1
     l_info = "Line {}".format(l_start) if l_start == l_end else "Lines {}-{}".format(l_start, l_end)
-    
+
     symbol = get_symbol_at_point(view, target.begin())
     sym_info = ' inside "{}"'.format(symbol) if symbol else ""
 
@@ -113,17 +112,17 @@ def push_notification(method, params):
     for session_id in list(server.sessions.keys()):
         try:
             server.sessions[session_id].put(msg)
-        except:
+        except Exception:
             pass
 
 
 def push_context_update(window):
     if not window:
         return
-    
+
     roots = get_project_roots(window)
     open_files = []
-    
+
     for view in window.views():
         fname = view.file_name()
         if not fname or not os.path.exists(fname):
@@ -139,7 +138,7 @@ def push_context_update(window):
             if fname == r or fname.startswith(os.path.join(r, "")):
                 is_in_project = True
                 break
-        
+
         if not is_in_project and not is_active:
             continue
 
@@ -153,13 +152,15 @@ def push_context_update(window):
             row, col = view.rowcol(region.begin())
             cursor = {"line": row + 1, "character": col + 1}
 
-        open_files.append({
-            "path": fname,
-            "timestamp": int(time.time()), # Ideally we'd track last access time
-            "isActive": is_active,
-            "selectedText": selected_text,
-            "cursor": cursor,
-        })
+        open_files.append(
+            {
+                "path": fname,
+                "timestamp": int(time.time()),  # Ideally we'd track last access time
+                "isActive": is_active,
+                "selectedText": selected_text,
+                "cursor": cursor,
+            }
+        )
 
     params = {"workspaceState": {"openFiles": open_files, "isTrusted": True}}
     push_notification("ide/contextUpdate", params)
@@ -174,7 +175,7 @@ def write_settings_file():
     if not os.path.exists(settings_dir):
         try:
             os.makedirs(settings_dir)
-        except:
+        except Exception:
             pass
 
     settings_file_path = os.path.join(
@@ -193,7 +194,7 @@ def write_settings_file():
         with open(settings_file_path, "w") as f:
             json.dump(config, f)
         return settings_file_path
-    except:
+    except Exception:
         return None
 
 
@@ -271,31 +272,33 @@ main();
         launcher_dir = os.path.join(tempfile.gettempdir(), "gemini", "scripts")
         if not os.path.exists(launcher_dir):
             os.makedirs(launcher_dir)
-        
+
         launcher_path = os.path.join(launcher_dir, "gemini_launcher.cjs")
         with open(launcher_path, "w") as f:
             f.write(launcher_code)
         return launcher_path
-    except:
+    except Exception:
         return None
 
 
 # --- Commands ---
 class GeminiChatCommand(sublime_plugin.WindowCommand):
-    def run(self, instruction=None):
+    def run(self, instruction=None, location=None):
         """
         Runs the Gemini CLI in a Terminus view. If an instruction is provided,
         it sends it to the terminal.
         """
-        terminus_view = self.ensure_terminus_open()
+        terminus_view = self.ensure_terminus_open(location)
         if not terminus_view:
             return
 
         self.window.focus_view(terminus_view)
         if instruction:
-            self.window.run_command("terminus_send_string", {"string": instruction + "\n"})
+            self.window.run_command(
+                "terminus_send_string", {"string": instruction + "\n", "tag": "gemini_cli"}
+            )
 
-    def description(self, instruction=None):
+    def description(self, instruction=None, location=None):
         return "Gemini Chat: {}".format(instruction) if instruction else "Gemini Chat"
 
     def get_terminus_env(self, roots, cmd_args):
@@ -307,6 +310,11 @@ class GeminiChatCommand(sublime_plugin.WindowCommand):
             "LC_ALL": "en_US.UTF-8",
             "TERM_PROGRAM": "vscode",
         }
+
+        # Load user-defined environment variables
+        user_env = sublime.load_settings("Gemini.sublime-settings").get("environment", {})
+        if user_env:
+            env.update(user_env)
 
         settings_path = write_settings_file()
         if settings_path:
@@ -328,36 +336,38 @@ class GeminiChatCommand(sublime_plugin.WindowCommand):
         # We assume 'node' is in PATH since Gemini CLI requires it
         return ["node", launcher_path] + cmd_args
 
-    def ensure_terminus_open(self):
-        global server
-        current_port = server.server_address[1] if server else None
+    def _find_existing_terminus(self, location, panel_name, tag, current_port):
+        if location == "panel":
+            target_view = self.window.find_output_panel(panel_name)
+            if target_view:
+                view_port = target_view.settings().get("gemini_server_port")
+                if current_port and view_port != current_port:
+                    self.window.run_command("terminus_close", {"panel": "output." + panel_name})
+                    return None
+            return target_view
 
-        # 1. Search for existing view
         for v in self.window.views():
-            if v.name() == "Gemini CLI":
+            if v.settings().get("terminus_view.tag") == tag:
                 view_port = v.settings().get("gemini_server_port")
                 if current_port and view_port != current_port:
                     v.close()
                     break
-                self.window.focus_view(v)
                 return v
+        return None
 
-        if not sublime.find_resources("Terminus.sublime-settings"):
-            sublime.error_message("Install Terminus.")
-            return None
+    def _prepare_view_location(self, location):
+        if location == "split":
+            if self.window.num_groups() == 1:
+                self.window.set_layout(
+                    {
+                        "cols": [0.0, 1.0],
+                        "rows": [0.0, 0.6, 1.0],
+                        "cells": [[0, 0, 1, 1], [0, 1, 1, 2]],
+                    }
+                )
+            self.window.focus_group(self.window.num_groups() - 1)
 
-        # 2. Prepare for new view
-        # If we only have one group, create a split (top/bottom)
-        if self.window.num_groups() == 1:
-            self.window.set_layout({
-                "cols": [0.0, 1.0],
-                "rows": [0.0, 0.6, 1.0],
-                "cells": [[0, 0, 1, 1], [0, 1, 1, 2]]
-            })
-        
-        # Focus the last group (usually the right-most one)
-        self.window.focus_group(self.window.num_groups() - 1)
-
+    def _create_terminus_view(self, location, panel_name, title, tag):
         roots = get_project_roots(self.window)
         cmd_args = [get_gemini_path()]
         for r in roots:
@@ -367,19 +377,60 @@ class GeminiChatCommand(sublime_plugin.WindowCommand):
         env = self.get_terminus_env(roots, cmd_args)
         cmd_args = self.get_shell_cmd(cmd_args)
 
-        # Debug print
         print("[Gemini] Launching Terminus with env:", env)
 
-        self.window.run_command(
-            "terminus_open",
-            {"cmd": cmd_args, "cwd": cwd, "title": "Gemini CLI", "auto_close": False, "env": env},
-        )
+        args = {
+            "cmd": cmd_args,
+            "cwd": cwd,
+            "title": title,
+            "auto_close": False,
+            "env": env,
+            "tag": tag,
+        }
 
-        view = self.window.active_view()
-        if view and current_port:
-            view.settings().set("gemini_server_port", current_port)
-            # Ensure it's not a scratch buffer so it persists (optional, but Terminus handles this)
-        return view
+        if location == "panel":
+            args["panel_name"] = panel_name
+
+        self.window.run_command("terminus_open", args)
+
+        if location == "panel":
+            return self.window.find_output_panel(panel_name)
+        return self.window.active_view()
+
+    def ensure_terminus_open(self, location=None):
+        global server
+        current_port = server.server_address[1] if server else None
+        settings = sublime.load_settings("Gemini.sublime-settings")
+
+        if not location:
+            location = settings.get("view_location", "split")
+
+        panel_name, title, tag = "Gemini CLI", "Gemini CLI", "gemini_cli"
+
+        target_view = self._find_existing_terminus(location, panel_name, tag, current_port)
+
+        if target_view:
+            if location == "panel":
+                self.window.run_command("show_panel", {"panel": "output." + panel_name})
+            else:
+                self.window.focus_view(target_view)
+        else:
+            if not sublime.find_resources("Terminus.sublime-settings"):
+                sublime.error_message("Install Terminus.")
+                return None
+
+            self._prepare_view_location(location)
+            target_view = self._create_terminus_view(location, panel_name, title, tag)
+
+        if target_view and current_port:
+            target_view.settings().set("gemini_server_port", current_port)
+
+        return target_view
+
+
+class GeminiStopCommand(sublime_plugin.WindowCommand):
+    def run(self):
+        self.window.run_command("terminus_keypress", {"key": "ctrl+c", "tag": "gemini_cli"})
 
 
 class GeminiDebugEnvCommand(sublime_plugin.WindowCommand):
@@ -388,6 +439,11 @@ class GeminiDebugEnvCommand(sublime_plugin.WindowCommand):
         global server
         if server:
             env["GEMINI_CLI_IDE_SERVER_PORT"] = str(server.server_address[1])
+
+        # Load user-defined environment variables
+        user_env = sublime.load_settings("Gemini.sublime-settings").get("environment", {})
+        if user_env:
+            env.update(user_env)
 
         # Ensure IDE mode is enabled by injecting a system settings file
         settings_path = write_settings_file()
@@ -407,29 +463,35 @@ class GeminiDebugEnvCommand(sublime_plugin.WindowCommand):
 
 
 class GeminiInsertContextCommand(sublime_plugin.WindowCommand):
+    def _find_terminal_view(self, tag):
+        for v in self.window.views():
+            if v.settings().get("terminus_view.tag") == tag:
+                return v, False
+
+        panel_view = self.window.find_output_panel("Gemini CLI")
+        if panel_view:
+            return panel_view, True
+        return None, False
+
+    def _find_source_view(self, terminus_view, is_panel):
+        code_view = self.window.active_view()
+        if code_view and terminus_view and not is_panel and code_view.id() == terminus_view.id():
+            code_view = self.window.active_view_in_group(0)
+            if code_view and code_view.id() == terminus_view.id():
+                code_view = self.window.active_view_in_group(1)
+
+            if not code_view or code_view.id() == terminus_view.id():
+                code_view = None
+                for v in self.window.views():
+                    if v.id() != terminus_view.id() and v.file_name():
+                        code_view = v
+                        break
+        return code_view
+
     def run(self):
-        # 1. Find Gemini CLI terminal
-        terminus_view = self.window.active_view()
-        if not terminus_view or terminus_view.name() != "Gemini CLI":
-            # Search for it if not active
-            for v in self.window.views():
-                if v.name() == "Gemini CLI":
-                    terminus_view = v
-                    break
-
-        # 2. Find the Code View (most likely in Group 0)
-        code_view = self.window.active_view_in_group(0)
-
-        # If terminal is in group 0, try group 1
-        if code_view and terminus_view and code_view.id() == terminus_view.id():
-            code_view = self.window.active_view_in_group(1)
-
-        # Fallback: Just find ANY other file
-        if not code_view or (terminus_view and code_view.id() == terminus_view.id()):
-            for v in self.window.views():
-                if v.file_name() and (not terminus_view or v.id() != terminus_view.id()):
-                    code_view = v
-                    break
+        tag = "gemini_cli"
+        terminus_view, is_panel = self._find_terminal_view(tag)
+        code_view = self._find_source_view(terminus_view, is_panel)
 
         if not code_view:
             return
@@ -439,8 +501,15 @@ class GeminiInsertContextCommand(sublime_plugin.WindowCommand):
         if not context_str:
             return
 
-        self.window.focus_view(terminus_view)
-        self.window.run_command("terminus_send_string", {"string": " " + context_str + " "})
+        if is_panel:
+            self.window.run_command("show_panel", {"panel": "output.Gemini CLI"})
+            self.window.focus_view(terminus_view)
+        elif terminus_view:
+            self.window.focus_view(terminus_view)
+
+        self.window.run_command(
+            "terminus_send_string", {"string": " " + context_str + " ", "tag": tag}
+        )
 
 
 class GeminiInlineCommand(sublime_plugin.TextCommand):
@@ -474,7 +543,7 @@ def start_server_async():
         if not os.path.exists(ide_dir):
             try:
                 os.makedirs(ide_dir)
-            except:
+            except Exception:
                 pass
 
         sticky_port_file = os.path.join(ide_dir, "gemini-port-{}.txt".format(pid))
@@ -484,7 +553,7 @@ def start_server_async():
             try:
                 with open(sticky_port_file, "r") as f:
                     port = int(f.read().strip())
-            except:
+            except Exception:
                 pass
 
         try:
@@ -508,7 +577,7 @@ def start_server_async():
         try:
             with open(sticky_port_file, "w") as f:
                 f.write(str(actual_port))
-        except:
+        except Exception:
             pass
 
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -541,14 +610,14 @@ def write_discovery_file(window):
         )
         if grandparent and grandparent.isdigit():
             pids.append(int(grandparent))
-    except:
+    except Exception:
         pass
 
     discovery_dir = os.path.join(tempfile.gettempdir(), "gemini", "ide")
     if not os.path.exists(discovery_dir):
         try:
             os.makedirs(discovery_dir)
-        except:
+        except Exception:
             pass
 
     for pid in set(pids):
@@ -564,7 +633,7 @@ def write_discovery_file(window):
         try:
             with open(discovery_file_path, "w") as f:
                 json.dump(info, f)
-        except:
+        except Exception:
             pass
 
 
@@ -620,7 +689,7 @@ class GeminiAcceptDiffCommand(sublime_plugin.TextCommand):
                 with open(diff_file, "w") as f:
                     f.write(content)
                 self.view.close()
-            except:
+            except Exception:
                 pass
 
     def is_visible(self):

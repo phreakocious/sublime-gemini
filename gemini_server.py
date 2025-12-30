@@ -123,7 +123,11 @@ class MCPServerHandler(http.server.BaseHTTPRequestHandler):
             self.log_message("POST Error: %s", e)
             self.send_response(500)
             self.end_headers()
-            self.wfile.write(str(e).encode("utf-8"))
+            self.wfile.write(
+                json.dumps({"jsonrpc": "2.0", "error": {"code": -32603, "message": str(e)}}).encode(
+                    "utf-8"
+                )
+            )
 
     def log_message(self, format, *args):
         import sys
@@ -153,50 +157,7 @@ class GeminiDelegate:
         msg_id = request.get("id")
 
         if method == "tools/list":
-            return {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
-                    "tools": [
-                        {
-                            "name": "openDiff",
-                            "description": "Open a diff view for a file",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "filePath": {"type": "string"},
-                                    "newContent": {"type": "string"},
-                                    "explanation": {"type": "string"},
-                                    "blocking": {"type": "boolean"},
-                                },
-                                "required": ["filePath", "newContent"],
-                            },
-                        },
-                        {
-                            "name": "closeDiff",
-                            "description": "Close a diff view",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {"filePath": {"type": "string"}},
-                                "required": ["filePath"],
-                            },
-                        },
-                        {
-                            "name": "navigateTo",
-                            "description": "Open a file and scroll to a specific line/character",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {
-                                    "filePath": {"type": "string"},
-                                    "line": {"type": "integer"},
-                                    "character": {"type": "integer"},
-                                },
-                                "required": ["filePath", "line"],
-                            },
-                        },
-                    ]
-                },
-            }
+            return self._list_tools(msg_id)
 
         elif method == "tools/call":
             tool_name = params.get("name")
@@ -213,17 +174,66 @@ class GeminiDelegate:
                 return self.error_response(msg_id, -32601, "Method not found")
 
         elif method == "initialize":
-            return {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "result": {
-                    "protocolVersion": "2024-11-05",
-                    "serverInfo": {"name": "sublime-gemini", "version": "1.0.0"},
-                    "capabilities": {"tools": {}},
-                },
-            }
+            return self._handle_initialize(msg_id)
 
         return self.error_response(msg_id, -32601, "Method not found")
+
+    def _list_tools(self, msg_id):
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "tools": [
+                    {
+                        "name": "openDiff",
+                        "description": "Open a diff view for a file",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "filePath": {"type": "string"},
+                                "newContent": {"type": "string"},
+                                "explanation": {"type": "string"},
+                                "blocking": {"type": "boolean"},
+                            },
+                            "required": ["filePath", "newContent"],
+                        },
+                    },
+                    {
+                        "name": "closeDiff",
+                        "description": "Close a diff view",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"filePath": {"type": "string"}},
+                            "required": ["filePath"],
+                        },
+                    },
+                    {
+                        "name": "navigateTo",
+                        "description": "Open a file and scroll to a specific line/character",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "filePath": {"type": "string"},
+                                "line": {"type": "integer"},
+                                "character": {"type": "integer"},
+                            },
+                            "required": ["filePath", "line"],
+                        },
+                    },
+                ]
+            },
+        }
+
+    def _handle_initialize(self, msg_id):
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "serverInfo": {"name": "sublime-gemini", "version": "1.0.0"},
+                "capabilities": {"tools": {}},
+            },
+        }
 
     def handle_navigate_to(self, msg_id, args):
         path = args.get("filePath")
@@ -233,7 +243,7 @@ class GeminiDelegate:
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
-            "result": {"content": [{"type": "text", "text": "Navigated to " + str(path)}]}
+            "result": {"content": [{"type": "text", "text": "Navigated to " + str(path)}]},
         }
 
     def _navigate_ui(self, path, line, col):
@@ -246,7 +256,6 @@ class GeminiDelegate:
         explanation = args.get("explanation", "Gemini has proposed changes to this file.")
         blocking = args.get("blocking", False)
 
-        # Store metadata including original content placeholder (will be filled in UI thread)
         request_context = {
             "msg_id": msg_id,
             "session_id": session_id,
@@ -254,104 +263,72 @@ class GeminiDelegate:
             "original_content": None,
             "blocking": blocking,
         }
-        
+
         if blocking:
             request_context["queue"] = queue.Queue(maxsize=1)
 
         self.pending_diffs[file_path] = request_context
-
         sublime.set_timeout(lambda: self._open_diff_ui(file_path, new_content, explanation), 0)
-        
+
         if blocking:
-            # Wait for user action
             try:
-                # 10 minute timeout
                 result = request_context["queue"].get(timeout=600)
                 return {
                     "jsonrpc": "2.0",
                     "id": msg_id,
-                    "result": {"content": [{"type": "text", "text": json.dumps(result)}]}
+                    "result": {"content": [{"type": "text", "text": json.dumps(result)}]},
                 }
             except queue.Empty:
                 return self.error_response(msg_id, -32000, "Timeout waiting for user action")
 
-        # Return immediate success to acknowledge tool call.
-        # The actual result (accepted/rejected) will be sent via notification.
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
-            "result": {"content": [{"type": "text", "text": "Diff view opened"}]}
+            "result": {"content": [{"type": "text", "text": "Diff view opened"}]},
         }
 
-    def _open_diff_ui(self, file_path, new_content, explanation):
+    def _prepare_diff_view(self, file_path):
         window = sublime.active_window()
         view = window.find_open_file(file_path)
-
         if not view:
             view = window.open_file(file_path)
-        
-        if view.is_loading():
-            sublime.set_timeout(lambda: self._open_diff_ui(file_path, new_content, explanation), 50)
-            return
+        return view
 
-        # Bring to front
-        window.focus_view(view)
-
-        # 1. Capture Original Content
-        original_content = view.substr(sublime.Region(0, view.size()))
-
-        # Update pending diff with original content for revert
-        if file_path in self.pending_diffs:
-            self.pending_diffs[file_path]["original_content"] = original_content
-
-        # 2. Set Reference Document (enables diff gutter)
-        view.set_reference_document(original_content)
-
-        # 3. Apply New Content
-        # Use custom command to replace content without auto-indent side effects
-        view.run_command("gemini_replace_content", {"text": new_content})
-
-        view.settings().set("gemini_diff_file", file_path)
-        view.settings().set("gemini_is_diff", True)
-
-        # 4. Highlight changes and scroll to first change
+    def _apply_diff_highlights(self, view, original_content, new_content):
         try:
             original_lines = original_content.splitlines(keepends=True)
             new_lines = new_content.splitlines(keepends=True)
             matcher = difflib.SequenceMatcher(None, original_lines, new_lines)
-            
+
             changed_regions = []
             first_change_pt = None
             last_change_pt = None
 
             for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-                if tag != 'equal':
+                if tag != "equal":
                     start_pt = view.text_point(j1, 0)
                     end_pt = view.text_point(j2, 0)
-                    
                     if first_change_pt is None:
                         first_change_pt = start_pt
-                    
                     last_change_pt = end_pt
-                    
                     changed_regions.append(sublime.Region(start_pt, end_pt))
 
             if changed_regions:
-                # Use "region.yellowish" for better visibility in most schemes
-                view.add_regions("gemini_changes", changed_regions, "region.yellowish", "", sublime.DRAW_NO_FILL)
-            
+                view.add_regions(
+                    "gemini_changes", changed_regions, "region.yellowish", "", sublime.DRAW_NO_FILL
+                )
+
             if first_change_pt is not None:
                 view.show_at_center(first_change_pt)
-                
+            return last_change_pt
         except Exception as e:
             print("[Gemini] Error calculating diff highlights:", e)
-            last_change_pt = None
+            return None
 
-        # 5. HTML Phantom
+    def _add_diff_phantoms(self, view, file_path, explanation, last_change_pt):
         import html as html_module
 
         safe_explanation = html_module.escape(explanation)
-
         html = """
         <body id="gemini-diff">
             <style>
@@ -380,11 +357,9 @@ class GeminiDelegate:
             explanation=safe_explanation
         )
 
-        # Clear old phantoms if any
         view.erase_phantoms("gemini_diff_header")
         view.erase_phantoms("gemini_diff_footer")
-        
-        # Header Phantom
+
         view.add_phantom(
             "gemini_diff_header",
             sublime.Region(0, 0),
@@ -393,12 +368,9 @@ class GeminiDelegate:
             lambda href: self.resolve_diff(file_path, href == "accept"),
         )
 
-        # Footer Phantom (after last change, or end of file if undefined)
         footer_pt = last_change_pt if last_change_pt is not None else view.size()
-        # Ensure we don't double-add if file is tiny and header/footer would overlap? 
-        # Phantoms stack, so it's fine, just might look redundant.
-        if footer_pt > 100: # Only add footer if there's some distance from top
-             view.add_phantom(
+        if footer_pt > 100:
+            view.add_phantom(
                 "gemini_diff_footer",
                 sublime.Region(footer_pt, footer_pt),
                 html,
@@ -406,14 +378,31 @@ class GeminiDelegate:
                 lambda href: self.resolve_diff(file_path, href == "accept"),
             )
 
+    def _open_diff_ui(self, file_path, new_content, explanation):
+        view = self._prepare_diff_view(file_path)
+        if view.is_loading():
+            sublime.set_timeout(lambda: self._open_diff_ui(file_path, new_content, explanation), 50)
+            return
+
+        sublime.active_window().focus_view(view)
+        original_content = view.substr(sublime.Region(0, view.size()))
+
+        if file_path in self.pending_diffs:
+            self.pending_diffs[file_path]["original_content"] = original_content
+
+        view.set_reference_document(original_content)
+        view.run_command("gemini_replace_content", {"text": new_content})
+        view.settings().set("gemini_diff_file", file_path)
+        view.settings().set("gemini_is_diff", True)
+
+        last_change_pt = self._apply_diff_highlights(view, original_content, new_content)
+        self._add_diff_phantoms(view, file_path, explanation, last_change_pt)
+
     def _accept_diff(self, view, file_path):
         if not view:
-             # Safety: Do not return empty content if view is lost.
-             # Ideally we should fail or try to recover.
-             # Returning error result to CLI so it doesn't write empty file.
-             return {
+            return {
                 "msg": None,
-                "result": {"status": "rejected", "error": "View not found during acceptance"}
+                "result": {"status": "rejected", "error": "View not found during acceptance"},
             }
 
         final_content = view.substr(sublime.Region(0, view.size()))
@@ -422,16 +411,16 @@ class GeminiDelegate:
         view.erase_phantoms("gemini_diff_footer")
         view.settings().erase("gemini_diff_file")
         view.settings().erase("gemini_is_diff")
-        view.set_reference_document("")  # Clear diff markers
+        view.set_reference_document("")
         sublime.status_message("Gemini: Changes accepted.")
-        
+
         return {
             "msg": {
                 "jsonrpc": "2.0",
                 "method": "ide/diffAccepted",
-                "params": {"filePath": file_path, "content": final_content}
+                "params": {"filePath": file_path, "content": final_content},
             },
-            "result": {"status": "accepted", "content": final_content}
+            "result": {"status": "accepted", "content": final_content},
         }
 
     def _reject_diff(self, view, file_path, original_content):
@@ -449,56 +438,46 @@ class GeminiDelegate:
             "msg": {
                 "jsonrpc": "2.0",
                 "method": "ide/diffRejected",
-                "params": {"filePath": file_path}
+                "params": {"filePath": file_path},
             },
-            "result": {"status": "rejected"}
+            "result": {"status": "rejected"},
         }
 
     def resolve_diff(self, file_path, accepted):
-        window = sublime.active_window()
         view = None
-        for v in window.views():
-            if v.file_name() == file_path:
+        for v in sublime.active_window().views():
+            if v.file_name() == file_path or v.settings().get("gemini_diff_file") == file_path:
                 view = v
                 break
 
-        if not view:
-            for v in window.views():
-                if v.settings().get("gemini_diff_file") == file_path:
-                    view = v
-                    break
-
         req = self.pending_diffs.get(file_path)
         if req:
-            session_id = req["session_id"]
-            server = req["server"]
-            original_content = req["original_content"]
+            session_id, server, original_content = (
+                req["session_id"],
+                req["server"],
+                req["original_content"],
+            )
             blocking = req.get("blocking", False)
 
-            if accepted:
-                outcome = self._accept_diff(view, file_path)
-            else:
-                outcome = self._reject_diff(view, file_path, original_content)
+            outcome = (
+                self._accept_diff(view, file_path)
+                if accepted
+                else self._reject_diff(view, file_path, original_content)
+            )
 
             if session_id in server.sessions:
                 server.sessions[session_id].put(outcome["msg"])
-            
             if blocking and "queue" in req:
                 req["queue"].put(outcome["result"])
-
             del self.pending_diffs[file_path]
 
     def handle_close_diff(self, msg_id, args):
         file_path = args.get("filePath")
-        # Trigger resolution (rejection) which will also handle closing the view/cleaning up
-        # We run this on the main thread
         sublime.set_timeout(lambda: self.resolve_diff(file_path, False), 0)
-
-        # We return success immediately, as the actual "closed" state is handled by the notification
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
-            "result": {"content": [{"type": "text", "text": "Diff closed"}]}
+            "result": {"content": [{"type": "text", "text": "Diff closed"}]},
         }
 
     def error_response(self, msg_id, code, message):

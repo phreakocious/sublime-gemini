@@ -59,5 +59,3 @@ Settings are available in `Preferences > Package Settings > Gemini`.
 ## Development Notes
 
 **State**: Active Development / Beta.
-
-**Caveat**: The codebase uses a hybrid Python approach to maintain compatibility with Sublime Text's internal environment while enabling modern features.

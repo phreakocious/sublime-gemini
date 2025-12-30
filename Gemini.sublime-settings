@@ -1,5 +1,13 @@
 {
     // Path to the gemini executable. 
     // If it's in your PATH, "gemini" is sufficient.
-    "gemini_path": "/usr/local/bin/gemini"
+    "gemini_path": "/usr/local/bin/gemini",
+
+    // Environment variables to pass to the Gemini process.
+    // Useful for setting GOOGLE_CLOUD_PROJECT or other cloud provider settings.
+    "environment": {},
+
+    // Where to open the Gemini chat view.
+    // Options: "split" (default), "tab", "panel"
+    "view_location": "split"
 }

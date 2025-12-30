@@ -14,5 +14,9 @@
     {
         "caption": "Gemini: Reject Diff",
         "command": "gemini_reject_diff"
+    },
+    {
+        "caption": "Gemini: Stop Generation",
+        "command": "gemini_stop"
     }
 ]
