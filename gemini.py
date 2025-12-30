@@ -456,40 +456,108 @@ class GeminiChatCommand(sublime_plugin.WindowCommand):
 
         self.window.run_command("terminus_open", args)
 
+        view = None
         if location == "panel":
-            return self.window.find_output_panel(panel_name)
-        return self.window.active_view()
+            view = self.window.find_output_panel(panel_name)
+        else:
+            view = self.window.active_view()
+
+        if view:
+            view.settings().set("gemini_context_roots", roots)
+
+        return view
 
     def ensure_terminus_open(self, location=None):
         global server
         current_port = server.server_address[1] if server else None
         settings = sublime.load_settings("Gemini.sublime-settings")
+        current_roots = get_project_roots(self.window)
 
+        # If location is explicitly provided, we strict-check that location.
+        # If not, we try to find ANY existing instance to reuse.
+        strict_location = location is not None
         if not location:
             location = settings.get("view_location", "split")
 
         panel_name, title, tag = "Gemini CLI", "Gemini CLI", "gemini_cli"
 
-        target_view = self._find_existing_terminus(location, panel_name, tag, current_port)
+        target_view = None
 
+        # 1. Search for existing split/tab view
+        for v in self.window.views():
+            v_tag = v.settings().get("terminus_view.tag")
+            if v_tag == tag:
+                target_view = v
+                break
+
+        # 2. Search for existing panel (if not found view, or if strict location requires panel)
+        if not target_view or (strict_location and location == "panel"):
+            panel_view = self.window.find_output_panel(panel_name)
+            if panel_view:
+                # If we found a split view but strict location is panel, ignore the split view
+                if strict_location and location == "panel":
+                    target_view = panel_view
+                # If we didn't find a split view, use the panel
+                elif not target_view:
+                    target_view = panel_view
+
+        # 3. If strict location is "split" and we found a panel, ignore panel (force new split)
+        if (
+            strict_location
+            and location == "split"
+            and target_view == self.window.find_output_panel(panel_name)
+        ):
+            target_view = None
+
+        # Validate port AND roots reuse
         if target_view:
-            if location == "panel":
-                self.window.run_command("show_panel", {"panel": "output." + panel_name})
+            view_port = target_view.settings().get("gemini_server_port")
+            view_roots = target_view.settings().get("gemini_context_roots")
+
+            # Check 1: Port mismatch
+            port_mismatch = current_port and view_port and view_port != current_port
+
+            # Check 2: Roots mismatch (CLI scope changed)
+            # If view_roots is missing (legacy view), we assume it's valid and backfill it.
+            roots_mismatch = False
+            if view_roots is not None:
+                roots_mismatch = set(view_roots) != set(current_roots)
             else:
-                self.window.focus_view(target_view)
-            return target_view, False
-        else:
-            if not sublime.find_resources("Terminus.sublime-settings"):
-                sublime.error_message("Install Terminus.")
-                return None, False
+                target_view.settings().set("gemini_context_roots", current_roots)
 
-            self._prepare_view_location(location)
-            target_view = self._create_terminus_view(location, panel_name, title, tag)
+            if port_mismatch or roots_mismatch:
+                # Mismatch: close and recreate
+                if target_view == self.window.find_output_panel(panel_name):
+                    self.window.run_command("terminus_close", {"panel": "output." + panel_name})
+                else:
+                    target_view.close()
+                target_view = None
+            else:
+                # Match: Reuse!
+                if current_port and not view_port:
+                    target_view.settings().set("gemini_server_port", current_port)
+                # Ensure we update roots if they were missing
+                if not view_roots:
+                    target_view.settings().set("gemini_context_roots", current_roots)
 
-            if target_view and current_port:
-                target_view.settings().set("gemini_server_port", current_port)
+                if target_view == self.window.find_output_panel(panel_name):
+                    self.window.run_command("show_panel", {"panel": "output." + panel_name})
+                else:
+                    self.window.focus_view(target_view)
+                return target_view, False
 
-            return target_view, True
+        # If we get here, no valid existing instance found. Create new.
+        if not sublime.find_resources("Terminus.sublime-settings"):
+            sublime.error_message("Install Terminus.")
+            return None, False
+
+        self._prepare_view_location(location)
+        target_view = self._create_terminus_view(location, panel_name, title, tag)
+
+        if target_view and current_port:
+            target_view.settings().set("gemini_server_port", current_port)
+
+        return target_view, True
 
 
 class GeminiStopCommand(sublime_plugin.WindowCommand):
