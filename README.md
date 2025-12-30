@@ -4,7 +4,7 @@ Sublime Text integration for the [Gemini CLI](https://github.com/google-gemini/g
 
 ## Features
 
-- **Integrated Terminal Chat**: Runs the full Gemini CLI TUI inside a dedicated bottom panel in Sublime.
+- **Integrated Terminal Chat**: Runs the full Gemini CLI TUI inside Sublime (configurable as a panel, tab, or split).
 - **Context Aware**: Automatically shares your open files and project structure with the AI (respecting your project roots).
 - **Inline Refactoring**: Right-click code to Explain, Refactor, or Add Comments with a live diff preview.
 - **Enhanced Diff View**: 
@@ -32,9 +32,10 @@ Sublime Text integration for the [Gemini CLI](https://github.com/google-gemini/g
 
 ## Usage
 
-- **Chat**: Press `Cmd+Shift+G` (macOS) or `Ctrl+Shift+G` (Windows/Linux) to open the Gemini Console at the bottom of your window.
+- **Chat**: Press `Cmd+Shift+G` (macOS) or `Ctrl+Shift+G` (Windows/Linux) to open the Gemini Console.
 - **Insert Context**: Press `Cmd+Shift+I` (macOS) or `Ctrl+Shift+I` (Windows/Linux) while the Gemini Console is open to insert details about your current selection (file, lines, symbol) into the prompt.
 - **Refactor**: Select code, Right Click > **Gemini** > **Inline Edit / Refactor**.
+- **Stop Generation**: Open the Command Palette and select **Gemini: Stop Generation** to interrupt Gemini (sends Ctrl+C).
 - **Commands**: Open Command Palette (`Cmd+Shift+P`) and type `Gemini`.
 - **External Terminal**: Just run `gemini` commands in your system terminal. They will automatically detect the running Sublime Text instance for rich interactions.
 
@@ -52,7 +53,11 @@ Settings are available in `Preferences > Package Settings > Gemini`.
 
 ```json
 {
-    "gemini_path": "gemini" // Path to executable
+    "gemini_path": "gemini", // Path to executable
+    "view_location": "split", // Where to open chat: "split" (default), "tab", "panel"
+    "environment": {
+        "GOOGLE_CLOUD_PROJECT": "your-project-id"
+    }
 }
 ```
 
