@@ -5,6 +5,7 @@
         "children":
         [
             { "caption": "Chat / Ask...", "command": "gemini_chat" },
+            { "caption": "Chat (External Terminal)", "command": "gemini_chat_external" },
             { "caption": "-" },
             {
                 "caption": "Explain Code",

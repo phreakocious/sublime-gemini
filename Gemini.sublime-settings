@@ -9,5 +9,14 @@
 
     // Where to open the Gemini chat view.
     // Options: "split" (default), "tab", "panel"
-    "view_location": "split"
+    "view_location": "split",
+
+    // Custom external terminal command.
+    // If set, this overrides the default terminal detection logic.
+    // Use "$CMD" as a placeholder for the Gemini command string.
+    // Examples:
+    //   Linux: ["terminator", "-x", "$CMD"]
+    //   macOS (iTerm2 - requires custom scripting, or use 'open -a Terminal'): null
+    //   Windows: null
+    "external_terminal": null
 }

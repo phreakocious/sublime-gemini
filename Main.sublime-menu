@@ -13,6 +13,10 @@
                         "caption": "Ask Gemini..."
                     },
                     {
+                        "command": "gemini_chat_external",
+                        "caption": "Chat (External Terminal)"
+                    },
+                    {
                         "command": "gemini_stop",
                         "caption": "Stop Generation"
                     },

@@ -4,6 +4,10 @@
         "command": "gemini_chat"
     },
     {
+        "caption": "Gemini: Chat (External Terminal)",
+        "command": "gemini_chat_external"
+    },
+    {
         "caption": "Gemini: Inline Edit / Refactor",
         "command": "gemini_inline"
     },

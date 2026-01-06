@@ -1,5 +1,8 @@
+import hashlib
 import json
 import os
+import queue
+import shlex
 import subprocess
 import tempfile
 import threading
@@ -16,6 +19,8 @@ except Exception:
 
 # --- Global State ---
 server, discovery_file_path, settings_file_path = None, None, None
+last_active_views = {}  # window_id -> view_id
+last_context_hash = None
 
 
 # --- Helpers ---
@@ -28,7 +33,13 @@ def get_project_roots(window):
     roots = []
     if not window:
         return roots
-    if window.project_data() and "folders" in window.project_data():
+
+    # Check window.folders() first (standard API for open folders)
+    if window.folders():
+        for f in window.folders():
+            roots.append(os.path.abspath(f))
+
+    if not roots and window.project_data() and "folders" in window.project_data():
         for f in window.project_data()["folders"]:
             p = f["path"]
             if not os.path.isabs(p) and window.extract_variables().get("project_path"):
@@ -61,19 +72,22 @@ def get_symbol_at_point(view, point):
 
 
 def get_target_region(view):
-    s = view.sel()
-    if not s:
+    try:
+        s = view.sel()
+        if not s:
+            return None
+        target = s[0]
+        symbol = get_symbol_at_point(view, target.begin())
+        if symbol and target.size() < 50:
+            for r, name in view.symbols():
+                if name == symbol and r.contains(target.begin()):
+                    target = r
+                    break
+        if target.empty():
+            target = view.line(target)
+        return target if not target.empty() else None
+    except Exception:
         return None
-    target = s[0]
-    symbol = get_symbol_at_point(view, target.begin())
-    if symbol and target.size() < 50:
-        for r, name in view.symbols():
-            if name == symbol and r.contains(target.begin()):
-                target = r
-                break
-    if target.empty():
-        target = view.line(target)
-    return target if not target.empty() else None
 
 
 def format_context_string(view, target, roots):
@@ -111,30 +125,69 @@ def push_notification(method, params):
     if not server:
         return
     msg = {"jsonrpc": "2.0", "method": method, "params": params}
+
+    # Iterate over a copy of keys to allow safe deletion
     for session_id in list(server.sessions.keys()):
         try:
-            server.sessions[session_id].put(msg)
+            # Non-blocking put with timeout just in case, though usually unnecessary if we handle Full
+            server.sessions[session_id].put(msg, block=False)
+        except queue.Full:
+            print(
+                f"[Gemini] Session {session_id} queue full. Dropping message and removing session."
+            )
+            try:
+                del server.sessions[session_id]
+            except KeyError:
+                pass
         except Exception:
             pass
 
 
-def push_context_update(window):
+def push_context_update(window, force=False):
     if not window:
         return
 
     roots = get_project_roots(window)
     open_files = []
 
+    # Capture time once for consistent timestamps across all files in this update
+    now = int(time.time() * 1000)
+
     active_view = window.active_view()
-    # If the active view is a Terminus view, try to find the last active code view
-    # (This is an approximation; ideally we'd track Z-order)
+
+    # If the active view is a Terminus view, try to retrieve the last active code view
     if active_view and active_view.settings().get("terminus_view.tag"):
+        last_id = last_active_views.get(window.id())
         active_view = None
-        # Fallback: find the first non-terminus view
-        for v in window.views():
-            if not v.settings().get("terminus_view.tag"):
-                active_view = v
-                break
+
+        # Priority 1: Use the tracked last active view ID
+        if last_id:
+            for v in window.views():
+                if v.id() == last_id:
+                    active_view = v
+                    break
+
+        # Priority 2: If tracking failed, check if the window has another active view in a different group
+        # (Sublime sometimes keeps "active_view" pointing to the terminal even if another group has focus,
+        # but we can check active_view_in_group)
+        if not active_view:
+            num_groups = window.num_groups()
+            for i in range(num_groups):
+                v = window.active_view_in_group(i)
+                if v and not v.settings().get("terminus_view.tag"):
+                    active_view = v
+                    break
+
+        # Priority 3: Fallback to the first non-terminal view we find
+        if not active_view:
+            for v in window.views():
+                if not v.settings().get("terminus_view.tag"):
+                    active_view = v
+                    break
+
+    # If we still can't find an active code view, just abort the update to avoid clearing state
+    if active_view and active_view.settings().get("terminus_view.tag"):
+        return
 
     for view in window.views():
         fname = view.file_name()
@@ -162,24 +215,61 @@ def push_context_update(window):
         sel = view.sel()
         selected_text = ""
         cursor = {"line": 1, "character": 1}
-        if len(sel) > 0:
-            region = sel[0]
-            if not region.empty():
-                selected_text = view.substr(region)[:16384]  # Limit to 16KB
-            row, col = view.rowcol(region.begin())
-            cursor = {"line": row + 1, "character": col + 1}
+        try:
+            if len(sel) > 0:
+                region = sel[0]
+                if not region.empty():
+                    selected_text = view.substr(region)[:1024]  # Limit to 1KB
+                row, col = view.rowcol(region.begin())
+                cursor = {"line": row + 1, "character": col + 1}
+        except Exception:
+            pass
+
+        # Use pre-calculated timestamp
+        timestamp = now
+        # Hack: The CLI sorts by timestamp desc and expects the active file to be first.
+        # If it's not first, it assumes NO file is active.
+        # So we artificially boost the timestamp of the active file to guarantee it wins.
+        if is_active:
+            timestamp += 1000
 
         open_files.append(
             {
                 "path": fname,
-                "timestamp": int(time.time()),  # Ideally we'd track last access time
+                "timestamp": timestamp,
                 "isActive": is_active,
                 "selectedText": selected_text,
                 "cursor": cursor,
             }
         )
 
+    # Sort by timestamp desc and limit to 10 files to prevent payload issues
+    open_files.sort(key=lambda x: x["timestamp"], reverse=True)
+    open_files = open_files[:10]
+
+    if not open_files:
+        # print("[Gemini] Skipping empty context update.")
+        return
+
     params = {"workspaceState": {"openFiles": open_files, "isTrusted": True}}
+
+    # Deduplicate updates
+    global last_context_hash
+    try:
+        # Exclude timestamp from hash so that mere time passing doesn't trigger an update
+        # if the actual state (active file, cursor, selection) hasn't changed.
+        files_for_hashing = [{k: v for k, v in f.items() if k != "timestamp"} for f in open_files]
+        params_for_hashing = {"workspaceState": {"openFiles": files_for_hashing, "isTrusted": True}}
+
+        current_hash = hashlib.md5(
+            json.dumps(params_for_hashing, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        if last_context_hash == current_hash and not force:
+            return
+        last_context_hash = current_hash
+    except Exception:
+        pass
+
     push_notification("ide/contextUpdate", params)
 
 
@@ -199,15 +289,21 @@ def write_settings_file():
         settings_dir, "gemini-ide-settings-{}.json".format(os.getpid())
     )
     try:
-        config = {"ide": {"enabled": True}}
-        if server:
-            config["mcpServers"] = {
+        # We only need to enable IDE mode.
+        # The connection details are passed via environment variables (GEMINI_CLI_IDE_SERVER_PORT),
+        # which the CLI's internal IdeClient uses to auto-discover and connect.
+        # We also register it as an MCP server so general tools (navigateTo) are visible.
+        config = {
+            "ide": {"enabled": True},
+            "mcpServers": {
                 "sublime": {
                     "url": "http://127.0.0.1:{}/mcp".format(server.server_address[1]),
                     "headers": {"Authorization": server.auth_token},
                     "trust": True,
                 }
-            }
+            },
+        }
+
         with open(settings_file_path, "w") as f:
             json.dump(config, f)
         return settings_file_path
@@ -227,6 +323,7 @@ function main() {
     const ideDir = path.join(tmp, 'gemini', 'ide');
     let port = '';
     let token = '';
+    let workspacePath = '';
 
     try {
         if (fs.existsSync(ideDir)) {
@@ -239,13 +336,18 @@ function main() {
                 const data = JSON.parse(fs.readFileSync(path.join(ideDir, files[0].name), 'utf8'));
                 port = String(data.port || '');
                 token = data.authToken || '';
+                workspacePath = data.workspacePath || '';
             }
         }
     } catch (e) {}
 
     const env = { ...process.env };
-    env.GEMINI_CLI_IDE_SERVER_PORT = port;
-    env.GEMINI_CLI_IDE_AUTH_TOKEN = token;
+
+    // Explicitly set connection details in env as a fallback/primary method
+    if (port) env.GEMINI_CLI_IDE_SERVER_PORT = port;
+    if (token) env.GEMINI_CLI_IDE_AUTH_TOKEN = token;
+    if (workspacePath) env.GEMINI_CLI_IDE_WORKSPACE_PATH = workspacePath;
+
     env.TERM_PROGRAM = 'vscode';
 
     if (port) {
@@ -362,7 +464,8 @@ class GeminiChatCommand(sublime_plugin.WindowCommand):
 
     def send_instruction(self, instruction):
         self.window.run_command(
-            "terminus_send_string", {"string": instruction + "\n", "tag": "gemini_cli"}
+            "terminus_send_string",
+            {"string": instruction + "\n", "tag": "gemini_cli", "bracketed": True},
         )
         sublime.status_message("Gemini: Instruction sent.")
 
@@ -389,8 +492,6 @@ class GeminiChatCommand(sublime_plugin.WindowCommand):
             env["GEMINI_CLI_SYSTEM_SETTINGS_PATH"] = settings_path
 
         if server:
-            env["GEMINI_CLI_IDE_SERVER_PORT"] = str(server.server_address[1])
-            env["GEMINI_CLI_IDE_AUTH_TOKEN"] = server.auth_token
             if roots:
                 env["GEMINI_CLI_IDE_WORKSPACE_PATH"] = os.pathsep.join(roots)
 
@@ -568,6 +669,150 @@ class GeminiChatCommand(sublime_plugin.WindowCommand):
         return target_view, True
 
 
+class GeminiChatExternalCommand(sublime_plugin.WindowCommand):
+    def run(self):
+        roots = get_project_roots(self.window)
+        gemini_path = get_gemini_path()
+
+        # Prepare arguments
+        cmd_args = [gemini_path]
+        for r in roots:
+            cmd_args.extend(["--include-directories", r])
+
+        launcher_path = write_launcher_script()
+        if not launcher_path:
+            sublime.error_message("Gemini: Failed to create launcher script.")
+            return
+
+        # Construct the command string safely
+        full_cmd_list = ["node", launcher_path] + cmd_args
+
+        cwd = roots[0] if roots else os.path.expanduser("~")
+        platform = sublime.platform()
+
+        if platform == "windows":
+            # Windows: cd /d, double quotes
+            quoted_args = ['"{}"'.format(arg.replace('"', '""')) for arg in full_cmd_list]
+            full_cmd_str = 'cd /d "{}" && {}'.format(cwd, " ".join(quoted_args))
+        else:
+            # POSIX: shlex.quote
+            full_cmd_str = "cd {} && {}".format(
+                shlex.quote(cwd), " ".join(shlex.quote(arg) for arg in full_cmd_list)
+            )
+
+        # Check for user-configured terminal command
+        settings = sublime.load_settings("Gemini.sublime-settings")
+        custom_terminal = settings.get("external_terminal")
+
+        if custom_terminal:
+            # User provided a custom command (e.g., ["terminator", "-x", "$CMD"])
+            if isinstance(custom_terminal, list):
+                cmd = [arg.replace("$CMD", full_cmd_str) for arg in custom_terminal]
+                try:
+                    subprocess.Popen(cmd)
+                    return
+                except Exception as e:
+                    sublime.error_message("Gemini: Failed to launch custom terminal: {}".format(e))
+                    # Fallthrough to default logic is risky if custom failed, better to stop or let user know.
+                    return
+            else:
+                print("[Gemini] 'external_terminal' setting must be a list of strings.")
+
+        if platform == "osx":
+            # macOS: Check for iTerm2 first
+            safe_cmd = full_cmd_str.replace("\\", "\\\\").replace('"', '\\"')
+            iterm_paths = [
+                "/Applications/iTerm.app",
+                os.path.expanduser("~/Applications/iTerm.app"),
+            ]
+            use_iterm = any(os.path.exists(p) for p in iterm_paths)
+
+            if use_iterm:
+                # iTerm2 AppleScript: opens a new tab in current window or a new window
+                iterm_script = """
+                tell application "iTerm"
+                    if not (exists window 1) then
+                        create window with default profile
+                    else
+                        tell current window
+                            create tab with default profile
+                        end tell
+                    end if
+                    tell current session of current window
+                        write text "{}"
+                    end tell
+                    activate
+                end tell
+                """.format(
+                    safe_cmd
+                )
+                try:
+                    subprocess.Popen(["osascript", "-e", iterm_script])
+                    return
+                except Exception as e:
+                    print(
+                        "[Gemini] Failed to launch iTerm2, falling back to Terminal.app: {}".format(
+                            e
+                        )
+                    )
+
+            # Fallback to Terminal.app
+            script = 'tell application "Terminal" to do script "{}"'.format(safe_cmd)
+            try:
+                subprocess.Popen(["osascript", "-e", script])
+                subprocess.Popen(["osascript", "-e", 'tell application "Terminal" to activate'])
+            except Exception as e:
+                sublime.error_message("Gemini: Failed to launch Terminal: {}".format(e))
+
+        elif platform == "linux":
+            # Linux: Check TERMINAL env var first
+            env_term = os.environ.get("TERMINAL")
+            if env_term:
+                # Naive attempt: assume standard -e flag if not gnome-terminal
+                # Many terminals (xterm, konsole, terminator) use -e.
+                # gnome-terminal uses --
+                flag = "--" if "gnome-terminal" in env_term else "-e"
+                try:
+                    subprocess.Popen([env_term, flag, "bash", "-c", full_cmd_str])
+                    return
+                except Exception:
+                    print(
+                        "[Gemini] Failed to launch $TERMINAL ({}), falling back.".format(env_term)
+                    )
+
+            # Fallback to common terminals
+            terminals = [
+                # gnome-terminal requires -- to separate args
+                ["gnome-terminal", "--", "bash", "-c", full_cmd_str],
+                # x-terminal-emulator varies, but -e usually works.
+                ["x-terminal-emulator", "-e", "bash", "-c", full_cmd_str],
+                # konsole -e ...
+                ["konsole", "-e", "bash", "-c", full_cmd_str],
+            ]
+
+            launched = False
+            for cmd in terminals:
+                try:
+                    subprocess.Popen(cmd)
+                    launched = True
+                    break
+                except FileNotFoundError:
+                    continue
+
+            if not launched:
+                sublime.error_message(
+                    "Gemini: No supported terminal emulator found (tried gnome-terminal, x-terminal-emulator, konsole). Set 'external_terminal' in settings."
+                )
+
+        elif platform == "windows":
+            # Windows: start cmd /k ...
+            # cmd /k keeps window open.
+            try:
+                subprocess.Popen('start "Gemini CLI" cmd /k {}'.format(full_cmd_str), shell=True)
+            except Exception as e:
+                sublime.error_message("Gemini: Failed to launch cmd: {}".format(e))
+
+
 class GeminiStopCommand(sublime_plugin.WindowCommand):
     def run(self):
         self.window.run_command("terminus_keypress", {"key": "ctrl+c", "tag": "gemini_cli"})
@@ -577,8 +822,6 @@ class GeminiDebugEnvCommand(sublime_plugin.WindowCommand):
     def run(self):
         env = {"TERM": "xterm-256color", "TERM_PROGRAM": "vscode"}
         global server
-        if server:
-            env["GEMINI_CLI_IDE_SERVER_PORT"] = str(server.server_address[1])
 
         # Load user-defined environment variables
         user_env = sublime.load_settings("Gemini.sublime-settings").get("environment", {})
@@ -718,6 +961,10 @@ def start_server_async():
 
         token = str(uuid.uuid4())
         delegate = gemini_server.GeminiDelegate()
+        # Trigger context update when tools are listed (client is ready)
+        delegate.on_tools_list = lambda: sublime.set_timeout_async(
+            lambda: push_context_update(sublime.active_window(), force=True), 1000
+        )
 
         # Sticky port logic
         pid = os.getppid()
@@ -763,6 +1010,7 @@ def start_server_async():
             pass
 
         threading.Thread(target=server.serve_forever, daemon=True).start()
+
         print("[Gemini] Server started on port " + str(actual_port))
         sublime.set_timeout(lambda: write_settings_file(), 50)
         sublime.set_timeout(lambda: write_discovery_file(sublime.active_window()), 100)
@@ -774,9 +1022,6 @@ def write_discovery_file(window):
     global discovery_file_path
     if not window or not server:
         return
-    port, token = server.server_address[1], server.auth_token
-    roots = get_project_roots(window)
-    ws = os.pathsep.join(roots) if roots else tempfile.gettempdir()
 
     # Write discovery files for both parent (plugin_host) and grandparent (Sublime Text)
     # to ensure gemini-cli can find it regardless of how it traverses the tree.
@@ -796,11 +1041,35 @@ def write_discovery_file(window):
         pass
 
     discovery_dir = os.path.join(tempfile.gettempdir(), "gemini", "ide")
-    if not os.path.exists(discovery_dir):
+
+    # Clean up OLD discovery files for these PIDs
+    if os.path.exists(discovery_dir):
+        for f in os.listdir(discovery_dir):
+            if f.endswith(".json"):
+                # Check if file belongs to one of our PIDs
+                if f.startswith("gemini-ide-server-"):
+                    parts = f.split("-")
+                    # parts: ['gemini', 'ide', 'server', 'PID', 'PORT.json']
+                    if len(parts) >= 4 and parts[3].isdigit() and int(parts[3]) in pids:
+                        try:
+                            os.remove(os.path.join(discovery_dir, f))
+                        except Exception:
+                            pass
+    else:
         try:
             os.makedirs(discovery_dir)
         except Exception:
             pass
+
+    roots = get_project_roots(window)
+    if not roots:
+        # Don't write discovery file if we don't have a valid workspace context yet.
+        # This prevents the CLI from seeing a mismatched (temp dir) workspace.
+        # And we already cleaned up, so no stale file remains.
+        return
+
+    port, token = server.server_address[1], server.auth_token
+    ws = os.pathsep.join(roots)
 
     for pid in pids:
         discovery_file_path = os.path.join(
@@ -827,12 +1096,29 @@ def plugin_loaded():
 def plugin_unloaded():
     global server, settings_file_path
     if server:
-        server.shutdown_flag = True
-        server.shutdown()
-        server.server_close()
+        s = server
         server = None
-    if discovery_file_path and os.path.exists(discovery_file_path):
-        os.remove(discovery_file_path)
+        s.shutdown_flag = True
+
+        def stop_server():
+            s.shutdown()
+            s.server_close()
+
+        threading.Thread(target=stop_server).start()
+
+    # Clean up discovery files for this process and parent
+    discovery_dir = os.path.join(tempfile.gettempdir(), "gemini", "ide")
+    if os.path.exists(discovery_dir):
+        pids = {os.getpid(), os.getppid()}
+        for f in os.listdir(discovery_dir):
+            if f.startswith("gemini-ide-server-") and f.endswith(".json"):
+                parts = f.split("-")
+                if len(parts) >= 4 and int(parts[3]) in pids:
+                    try:
+                        os.remove(os.path.join(discovery_dir, f))
+                    except Exception:
+                        pass
+
     if settings_file_path and os.path.exists(settings_file_path):
         os.remove(settings_file_path)
 
@@ -842,14 +1128,66 @@ class GeminiEventListener(sublime_plugin.EventListener):
     Listens for Sublime Text events to update Gemini's context and handle diff views.
     """
 
+    def __init__(self):
+        self.pending_update_tasks = {}  # window_id -> timeout_id
+
+    def schedule_update(self, window):
+        if not window:
+            return
+
+        wid = window.id()
+        # Cancel pending task for this window if any (debounce)
+        if wid in self.pending_update_tasks:
+            try:
+                # Note: Sublime Text doesn't expose a clear_timeout for async tasks easily
+                # if we used set_timeout_async directly.
+                # Instead, we track a timestamp or counter?
+                # Actually, standard practice in Sublime plugins for debouncing async work
+                # is to use a mutable flag or just accept that set_timeout (main thread)
+                # is better for the *scheduling* part, and then spawn the async worker.
+
+                # Let's use set_timeout (main thread) for the timer, which IS cancellable
+                # (via returning callback, or just ignore it).
+                # Wait, sublime.set_timeout doesn't return an ID.
+                # We have to use a "run_id" generation approach.
+                pass
+            except Exception:
+                pass
+
+        # Effective debounce implementation:
+        # We store a "last_request_time" for the window.
+        # The scheduled task checks if enough time has passed since the *last* request.
+        # But a simpler way with `sublime` is to chain them.
+
+        # Alternative: Use a closure with a unique ID.
+        request_id = time.time()
+        self.pending_update_tasks[wid] = request_id
+
+        def run_if_latest():
+            if self.pending_update_tasks.get(wid) == request_id:
+                sublime.set_timeout_async(lambda: push_context_update(window), 0)
+
+        sublime.set_timeout(run_if_latest, 500)
+
     def on_activated(self, view):
+        # Ignore terminal views and widget views (console input, search panels, etc.)
+        if view.settings().get("terminus_view.tag") or view.settings().get("is_widget"):
+            return
         if view.window():
-            write_discovery_file(view.window())
-            sublime.set_timeout_async(lambda: push_context_update(view.window()), 50)
+            # Track last active code view
+            if not view.settings().get("terminus_view.tag"):
+                last_active_views[view.window().id()] = view.id()
+
+            # Move heavy write_discovery_file to async
+            sublime.set_timeout_async(lambda: write_discovery_file(view.window()), 0)
+            self.schedule_update(view.window())
 
     def on_selection_modified(self, view):
+        # Ignore terminal views and widget views
+        if view.settings().get("terminus_view.tag") or view.settings().get("is_widget"):
+            return
         if view.window():
-            sublime.set_timeout_async(lambda: push_context_update(view.window()), 100)
+            self.schedule_update(view.window())
 
     def on_close(self, view):
         # Check if the closed view was a diff view

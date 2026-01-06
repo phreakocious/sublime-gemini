@@ -5,6 +5,8 @@ import json
 import os
 import queue
 import socketserver
+import sys
+import time
 import uuid
 
 import sublime
@@ -24,13 +26,31 @@ class MCPServerHandler(http.server.BaseHTTPRequestHandler):
         expected_token = self.server.auth_token
         self.log_message("Handling SSE. Auth: %s", auth_header)
 
-        if not auth_header or (
-            auth_header != expected_token and auth_header != "Bearer " + expected_token
-        ):
-            self.log_message("Auth failed")
+        # Handle 'Bearer <token>' or just '<token>'
+        provided_token = auth_header
+        if auth_header and auth_header.startswith("Bearer "):
+            provided_token = auth_header[7:]
+
+        if not auth_header or provided_token != expected_token:
+            self.log_message(
+                "Auth failed. Provided: %s, Expected: %s", provided_token, expected_token
+            )
             self.send_response(401)
             self.end_headers()
             return
+
+        # Read POST body if present (for initial Streamable HTTP request)
+        initial_request = None
+        if self.command == "POST":
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+                if content_length > 0:
+                    post_data = self.rfile.read(content_length)
+                    initial_request = json.loads(post_data.decode("utf-8"))
+            except Exception as e:
+                self.log_message("Error reading initial POST data: %s", e)
+                # Continue with SSE setup, but maybe log/error?
+                pass
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -39,15 +59,46 @@ class MCPServerHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
         session_id = str(uuid.uuid4())
-        q = queue.Queue()
+        q = queue.Queue(maxsize=100)
         self.server.sessions[session_id] = q
 
-        # Send endpoint event
-        # Use absolute URL to avoid client-side relative resolution issues
-        port = self.server.server_address[1]
-        endpoint_url = "http://127.0.0.1:{}/mcp?session_id={}".format(port, session_id)
+        # Send endpoint event FIRST
+        # Use absolute URL to prevent client resolution issues
+        host, port = self.server.server_address
+        # Handle case where host is 0.0.0.0 (though we bind to 127.0.0.1 usually)
+        if host == "0.0.0.0":
+            host = "127.0.0.1"
+
+        endpoint_url = "http://{}:{}/mcp?session_id={}".format(host, port, session_id)
         self.log_message("Sending endpoint: %s", endpoint_url)
         self.send_sse_event("endpoint", endpoint_url)
+
+        # Notify that a new session has been added (now that endpoint is sent)
+        if hasattr(self.server, "on_session_added") and self.server.on_session_added:
+            self.server.on_session_added(session_id)
+
+        # Process initial request if it existed
+        if initial_request:
+            try:
+                self.log_message(
+                    "Processing initial RPC from POST body: %s", initial_request.get("method")
+                )
+                # Note: handle_json_rpc might need session_id for context, which matches.
+                response = self.server.delegate.handle_json_rpc(
+                    initial_request, session_id, self.server
+                )
+                if response:
+                    # Enqueue the response as an SSE message
+                    q.put(response)
+            except Exception as e:
+                self.log_message("Error handling initial RPC: %s", e)
+                # Maybe send an error response via SSE?
+                error_response = {
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32603, "message": str(e)},
+                    "id": initial_request.get("id"),
+                }
+                q.put(error_response)
 
         try:
             while not self.server.shutdown_flag:
@@ -59,11 +110,12 @@ class MCPServerHandler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(b": heartbeat\n\n")
                     self.wfile.flush()
         except (ConnectionResetError, BrokenPipeError):
-            self.log_message("Client disconnected")
+            self.log_message("Client disconnected (ConnectionReset/BrokenPipe)")
             pass
         except Exception as e:
             self.log_message("SSE Error: %s", e)
         finally:
+            self.log_message("SSE Handler Exiting for session %s", session_id)
             if session_id in self.server.sessions:
                 del self.server.sessions[session_id]
 
@@ -79,11 +131,31 @@ class MCPServerHandler(http.server.BaseHTTPRequestHandler):
         self.log_message("POST request to %s", self.path)
         auth_header = self.headers.get("Authorization")
         expected_token = self.server.auth_token
-        if not auth_header or (
-            auth_header != expected_token and auth_header != "Bearer " + expected_token
-        ):
+
+        # Handle 'Bearer <token>' or just '<token>'
+        provided_token = auth_header
+        if auth_header and auth_header.startswith("Bearer "):
+            provided_token = auth_header[7:]
+
+        if not auth_header or provided_token != expected_token:
+            self.log_message(
+                "Auth failed. Provided: %s, Expected: %s", provided_token, expected_token
+            )
             self.send_response(401)
             self.end_headers()
+            return
+
+        # Check for SSE request via POST (Streamable HTTP)
+        # Only treat as new SSE session if session_id is NOT in URL.
+        # Existing sessions send POSTs to /mcp?session_id=..., which should be handled as RPCs.
+        from urllib.parse import parse_qs, urlparse
+
+        query = parse_qs(urlparse(self.path).query)
+        session_id_param = query.get("session_id", [None])[0]
+
+        accept_header = self.headers.get("Accept", "")
+        if "text/event-stream" in accept_header and not session_id_param:
+            self.handle_sse()
             return
 
         try:
@@ -108,6 +180,7 @@ class MCPServerHandler(http.server.BaseHTTPRequestHandler):
                     len(self.server.sessions),
                 )
             elif not session_id:
+                self.log_message("Warning: No session_id found and no active sessions available.")
                 # It's okay to not have a session for synchronous requests like initialize
                 pass
 
@@ -133,9 +206,8 @@ class MCPServerHandler(http.server.BaseHTTPRequestHandler):
             )
 
     def log_message(self, format, *args):
-        import sys
-
-        print("[Gemini Server] " + format % args)
+        timestamp = time.strftime("%H:%M:%S", time.localtime())
+        print("[%s] [Gemini Server] %s" % (timestamp, format % args))
         sys.stdout.flush()
 
 
@@ -148,11 +220,13 @@ class MCPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         self.delegate = delegate
         self.sessions = {}
         self.shutdown_flag = False
+        self.on_session_added = None
 
 
 class GeminiDelegate:
     def __init__(self):
         self.pending_diffs = {}
+        self.on_tools_list = None
 
     def handle_json_rpc(self, request, session_id, server):
         method = request.get("method")
@@ -160,6 +234,7 @@ class GeminiDelegate:
         msg_id = request.get("id")
 
         if method == "tools/list":
+            print("[Gemini Server] Handling tools/list")
             return self._list_tools(msg_id)
 
         elif method == "tools/call":
@@ -167,14 +242,17 @@ class GeminiDelegate:
             args = params.get("arguments", {})
             print("[Gemini Server] Tool Call:", tool_name)
 
-            if tool_name == "openDiff":
+            # Support both prefixed and non-prefixed calls
+            base_name = tool_name[8:] if tool_name.startswith("sublime:") else tool_name
+
+            if base_name == "openDiff":
                 return self.handle_open_diff(msg_id, args, session_id, server)
-            elif tool_name == "closeDiff":
+            elif base_name == "closeDiff":
                 return self.handle_close_diff(msg_id, args)
-            elif tool_name == "navigateTo":
+            elif base_name == "navigateTo":
                 return self.handle_navigate_to(msg_id, args)
             else:
-                return self.error_response(msg_id, -32601, "Method not found")
+                return self.error_response(msg_id, -32601, "Method not found: " + tool_name)
 
         elif method == "initialize":
             return self._handle_initialize(msg_id)
@@ -182,13 +260,15 @@ class GeminiDelegate:
         return self.error_response(msg_id, -32601, "Method not found")
 
     def _list_tools(self, msg_id):
+        if self.on_tools_list:
+            self.on_tools_list()
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
             "result": {
                 "tools": [
                     {
-                        "name": "openDiff",
+                        "name": "sublime:openDiff",
                         "description": "Open a diff view for a file",
                         "inputSchema": {
                             "type": "object",
@@ -437,7 +517,7 @@ class GeminiDelegate:
             "gemini_diff_panel",
             sublime.Region(0, 0),
             html,
-            sublime.LAYOUT_INLINE,
+            sublime.LAYOUT_BLOCK,
             lambda href: self.handle_diff_action(file_path, href),
         )
         window.run_command("show_panel", {"panel": "output.GeminiDiff"})
@@ -464,9 +544,8 @@ class GeminiDelegate:
 
         if action == "info":
             explanation = view.settings().get("gemini_diff_explanation", "No explanation provided.")
-            import html as html_module
 
-            safe_explanation = html_module.escape(explanation).replace("\n", "<br>")
+            safe_explanation = html.escape(explanation).replace("\n", "<br>")
 
             popup_html = """
             <body id="gemini-info">
@@ -516,9 +595,108 @@ class GeminiDelegate:
         view.settings().set("gemini_is_diff", True)
         view.settings().set("gemini_diff_explanation", explanation)
 
-        self._apply_diff_highlights(view, original_content, new_content)
+        # Move heavy diff calculation to background thread
+        sublime.set_timeout_async(
+            lambda: self._async_calc_diff(
+                view, file_path, original_content, new_content, window, current_panel, is_dirty
+            ),
+            0,
+        )
+
+    def _async_calc_diff(
+        self, view, file_path, original_content, new_content, window, current_panel, is_dirty
+    ):
+        # Calculate highlights (expensive)
+        # Note: _apply_diff_highlights returns None but applies changes to view.
+        # Since view methods must run on main thread, we must split the calculation from application
+        # or rely on Sublime's thread safety for add_phantom/add_regions if they are safe (they often aren't).
+        # Standard practice: Compute diff ops in background, apply to view in main thread.
+
+        try:
+            original_lines = original_content.splitlines(keepends=True)
+            new_lines = new_content.splitlines(keepends=True)
+            matcher = difflib.SequenceMatcher(None, original_lines, new_lines)
+            opcodes = list(matcher.get_opcodes())  # Realize list in background
+
+            # Schedule application on main thread
+            sublime.set_timeout(
+                lambda: self._apply_diff_ui(
+                    view, file_path, opcodes, original_lines, window, current_panel, is_dirty
+                ),
+                0,
+            )
+        except Exception as e:
+            print("[Gemini] Async diff error:", e)
+
+    def _apply_diff_ui(
+        self, view, file_path, opcodes, original_lines, window, current_panel, is_dirty
+    ):
+        if not view.is_valid():
+            return
+
+        changed_regions = []
+        view.erase_phantoms("gemini_diff_deleted")
+
+        first_change_pt = None
+
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag == "equal":
+                continue
+
+            start_pt = view.text_point(j1, 0)
+            end_pt = view.text_point(j2, 0)
+
+            if first_change_pt is None:
+                first_change_pt = start_pt
+
+            if tag in ("insert", "replace"):
+                changed_regions.append(sublime.Region(start_pt, end_pt))
+            elif tag == "delete":
+                changed_regions.append(sublime.Region(start_pt, start_pt))
+
+            if tag in ("delete", "replace"):
+                deleted_text = "".join(original_lines[i1:i2])
+                safe_text = html.escape(deleted_text)
+
+                phantom_html = """
+                <body id="gemini-diff-deleted">
+                    <style>
+                        body {
+                            background-color: #4b1818;
+                            color: #cccccc;
+                            margin: 0;
+                            padding: 1px 4px;
+                            border: 1px solid #6b2828;
+                        }
+                    </style>
+                    <div style="font-family: monospace; white-space: pre;">%s</div>
+                </body>
+                """ % (
+                    safe_text
+                )
+
+                view.add_phantom(
+                    "gemini_diff_deleted",
+                    sublime.Region(start_pt, start_pt),
+                    phantom_html,
+                    sublime.LAYOUT_BLOCK,
+                )
+
+        if changed_regions:
+            view.add_regions(
+                "gemini_changes", changed_regions, "markup.inserted", "", sublime.DRAW_NO_FILL
+            )
+
+        if first_change_pt is not None:
+            view.show_at_center(first_change_pt)
+
         self._add_diff_phantoms(view, file_path)
         self._show_diff_panel(window, file_path, current_panel, is_dirty)
+
+    def _apply_diff_highlights(self, view, original_content, new_content):
+        # Legacy method kept/modified if needed or removed?
+        # I'll keep a stub or remove it. The logic is moved to _async_calc_diff/_apply_diff_ui.
+        pass
 
     def _accept_diff(self, view, file_path, previous_panel=None):
         if not view:
