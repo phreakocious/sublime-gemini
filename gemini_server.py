@@ -266,6 +266,9 @@ class GeminiDelegate:
         elif method == "initialize":
             return self._handle_initialize(msg_id)
 
+        elif method.startswith("notifications/"):
+            return None
+
         return self.error_response(msg_id, -32601, "Method not found")
 
     def _list_tools(self, msg_id):
