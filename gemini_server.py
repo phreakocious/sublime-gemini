@@ -186,7 +186,15 @@ class MCPServerHandler(http.server.BaseHTTPRequestHandler):
 
             response = self.server.delegate.handle_json_rpc(request, session_id, self.server)
 
-            if response:
+            q = self.server.sessions.get(session_id) if session_id else None
+
+            if response and q:
+                # Enqueue the response as an SSE message
+                q.put(response)
+                self.send_response(202)  # Accepted
+                self.end_headers()
+            elif response:
+                # Fallback for clients not using SSE or if session lost
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
