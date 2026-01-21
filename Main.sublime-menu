@@ -49,14 +49,12 @@
                         "children":
                         [
                             {
-                                "command": "open_file",
-                                "args": {"file": "${packages}/Gemini/Gemini.sublime-settings"},
-                                "caption": "Settings"
-                            },
-                            {
-                                "command": "open_file",
-                                "args": {"file": "${packages}/Gemini/Gemini.sublime-settings", "default": "{\n\t\"gemini_path\": \"gemini\"\n}"},
-                                "caption": "Settings – Default"
+                                "caption": "Settings",
+                                "command": "edit_settings",
+                                "args": {
+                                    "base_file": "${packages}/Gemini/Gemini.sublime-settings",
+                                    "default": "// Gemini Settings - User\n{\n\t$0\n}\n"
+                                }
                             }
                         ]
                     }

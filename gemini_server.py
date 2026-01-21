@@ -8,6 +8,8 @@ import socketserver
 import sys
 import time
 import uuid
+from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 import sublime
 
@@ -20,6 +22,13 @@ class MCPServerHandler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _get_session_id(self) -> Optional[str]:
+        query = parse_qs(urlparse(self.path).query)
+        session_id_param = query.get("session_id", [None])[0]
+        session_id_header = self.headers.get("MCP-Session-Id")
+
+        return session_id_param or session_id_header
 
     def handle_sse(self):
         auth_header = self.headers.get("Authorization")
@@ -39,6 +48,16 @@ class MCPServerHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
 
+        # Check for session resumption
+        session_id = self._get_session_id()
+        is_new_session = False
+
+        if not session_id:
+            session_id = str(uuid.uuid4())
+            is_new_session = True
+        
+        self.log_message("SSE Connection for session: %s (New: %s)", session_id, is_new_session)
+
         # Read POST body if present (for initial Streamable HTTP request)
         initial_request = None
         if self.command == "POST":
@@ -56,13 +75,18 @@ class MCPServerHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
+        self.send_header("MCP-Session-Id", session_id)
         self.end_headers()
 
-        session_id = str(uuid.uuid4())
-        q = queue.Queue(maxsize=100)
-        self.server.sessions[session_id] = q
+        if session_id not in self.server.sessions:
+             self.server.sessions[session_id] = queue.Queue(maxsize=100)
+        
+        q = self.server.sessions[session_id]
 
-        # Send endpoint event FIRST
+        # Send endpoint event FIRST if it's a new session or requested? 
+        # Spec says "If the server initiates an SSE stream... SHOULD immediately send an SSE event... to prime the client"
+        # We should probably always send the endpoint event on connection open to be safe and compliant with "prime the client".
+        
         # Use absolute URL to prevent client resolution issues
         host, port = self.server.server_address
         # Handle case where host is 0.0.0.0 (though we bind to 127.0.0.1 usually)
@@ -73,8 +97,8 @@ class MCPServerHandler(http.server.BaseHTTPRequestHandler):
         self.log_message("Sending endpoint: %s", endpoint_url)
         self.send_sse_event("endpoint", endpoint_url)
 
-        # Notify that a new session has been added (now that endpoint is sent)
-        if hasattr(self.server, "on_session_added") and self.server.on_session_added:
+        # Notify that a new session has been added (only if genuinely new)
+        if is_new_session and hasattr(self.server, "on_session_added") and self.server.on_session_added:
             self.server.on_session_added(session_id)
 
         # Process initial request if it existed
@@ -83,7 +107,6 @@ class MCPServerHandler(http.server.BaseHTTPRequestHandler):
                 self.log_message(
                     "Processing initial RPC from POST body: %s", initial_request.get("method")
                 )
-                # Note: handle_json_rpc might need session_id for context, which matches.
                 response = self.server.delegate.handle_json_rpc(
                     initial_request, session_id, self.server
                 )
@@ -92,7 +115,6 @@ class MCPServerHandler(http.server.BaseHTTPRequestHandler):
                     q.put(response)
             except Exception as e:
                 self.log_message("Error handling initial RPC: %s", e)
-                # Maybe send an error response via SSE?
                 error_response = {
                     "jsonrpc": "2.0",
                     "error": {"code": -32603, "message": str(e)},
@@ -116,6 +138,11 @@ class MCPServerHandler(http.server.BaseHTTPRequestHandler):
             self.log_message("SSE Error: %s", e)
         finally:
             self.log_message("SSE Handler Exiting for session %s", session_id)
+            # Only delete session if it was ephemeral or we want to clean up.
+            # For now, let's keep it in sessions dict for a bit? 
+            # Or assume disconnection means session end? 
+            # Spec says "Server MAY terminate the session...". 
+            # If client disconnects, we should probably clean up to avoid leaks.
             if session_id in self.server.sessions:
                 del self.server.sessions[session_id]
 
@@ -146,15 +173,10 @@ class MCPServerHandler(http.server.BaseHTTPRequestHandler):
             return
 
         # Check for SSE request via POST (Streamable HTTP)
-        # Only treat as new SSE session if session_id is NOT in URL.
-        # Existing sessions send POSTs to /mcp?session_id=..., which should be handled as RPCs.
-        from urllib.parse import parse_qs, urlparse
-
-        query = parse_qs(urlparse(self.path).query)
-        session_id_param = query.get("session_id", [None])[0]
+        session_id = self._get_session_id()
 
         accept_header = self.headers.get("Accept", "")
-        if "text/event-stream" in accept_header and not session_id_param:
+        if "text/event-stream" in accept_header and not session_id:
             self.handle_sse()
             return
 
@@ -164,33 +186,25 @@ class MCPServerHandler(http.server.BaseHTTPRequestHandler):
             request = json.loads(post_data.decode("utf-8"))
             self.log_message("RPC Request: %s", request.get("method"))
 
-            # Extract session_id from query params if present
-            from urllib.parse import parse_qs, urlparse
-
-            query = parse_qs(urlparse(self.path).query)
-            session_id = query.get("session_id", [None])[0]
-
-            # Fallback: If no session_id in URL, use the most recent session.
-            if not session_id and self.server.sessions:
-                # Assuming dict preserves insertion order (Python 3.7+), the last one is the newest.
-                session_id = list(self.server.sessions.keys())[-1]
-                self.log_message(
-                    "Using fallback session_id: %s (of %d active)",
-                    session_id,
-                    len(self.server.sessions),
-                )
-            elif not session_id:
-                self.log_message("Warning: No session_id found and no active sessions available.")
-                # It's okay to not have a session for synchronous requests like initialize
-                pass
+            if not session_id:
+                self.log_message("No session_id found. Handling as stateless/synchronous request.")
 
             response = self.server.delegate.handle_json_rpc(request, session_id, self.server)
 
             if response:
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(json.dumps(response).encode("utf-8"))
+                # If we have an active session, prefer sending via SSE and returning 202 Accepted.
+                # This ensures the client receives it on the stream they are listening to.
+                if session_id and session_id in self.server.sessions:
+                    self.log_message("Enqueuing RPC response to SSE for session %s", session_id)
+                    self.server.sessions[session_id].put(response)
+                    self.send_response(202)
+                    self.end_headers()
+                else:
+                    # Fallback to direct response if no active session found
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(response).encode("utf-8"))
             else:
                 self.send_response(202)  # Accepted
                 self.end_headers()
@@ -257,6 +271,13 @@ class GeminiDelegate:
 
         elif method == "initialize":
             return self._handle_initialize(msg_id)
+
+        elif method == "notifications/initialized":
+            # Client ready, nothing to return
+            return None
+
+        elif method == "ping":
+            return {"jsonrpc": "2.0", "id": msg_id, "result": {}}
 
         return self.error_response(msg_id, -32601, "Method not found")
 
